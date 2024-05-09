@@ -1,3 +1,3 @@
 # Cvis
 
-#an image classification pipeline
+An image classification pipeline
