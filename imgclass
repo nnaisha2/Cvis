@@ -1,0 +1,333 @@
+import os
+import cv2
+import random
+import torch
+import torch.optim as optim
+from torch import nn
+import numpy as np
+import pandas as pd
+import torchvision
+import torchmetrics
+import torchmetrics.functional as F
+from torchmetrics import F1Score
+import matplotlib.pyplot as plt
+import torchvision.transforms as transforms
+from PIL import Image
+from tqdm.notebook import tqdm
+from collections import Counter
+from torch.utils.data import Dataset, DataLoader,SubsetRandomSampler
+from sklearn.model_selection import train_test_split
+
+class CustomImageDataset(Dataset):
+    def __init__(self, annotations_file, img_dir, transform=None, target_transform=None):
+        self.img_labels = pd.read_csv(annotations_file)
+        self.img_dir = img_dir
+        self.transform = transform
+        self.target_transform = target_transform
+
+       
+    def __len__(self):
+        return len(self.img_labels)
+
+    def __getitem__(self, idx):
+        img_filename = self.img_labels.iloc[idx, 0]
+        img_path = os.path.join(self.img_dir, img_filename)
+        
+        with Image.open(img_path) as img:
+            image = img.convert("RGB")
+        
+        label = self.img_labels.iloc[idx, -1]
+        min_x = self.img_labels.iloc[idx, 3]
+        min_y = self.img_labels.iloc[idx, 4]
+        max_x = self.img_labels.iloc[idx, 1]
+        max_y = self.img_labels.iloc[idx, 2]
+
+        
+        image = image.crop((min_x, min_y, max_x, max_y))
+
+        if self.transform:
+            image = self.transform(image)
+        if self.target_transform:
+            label = self.target_transform(label)
+        return image, label
+     
+#color jitter function
+
+def color_jitter(image, cj_type="b"):
+    if cj_type == "b":
+        # Limit the range of brightness adjustments
+        brightness = torch.tensor(random.uniform(-0.1, 0.4), dtype=torch.float32)
+        # Apply brightness jittering
+        image = torch.clamp(image + brightness, 0, 1)
+       
+    elif cj_type == "s":
+        saturation = torch.tensor(random.choice([-50, -40, -30, 30, 40, 50]), dtype=torch.float32)
+        # Apply saturation jittering
+        hsv_image = F.rgb_to_hsv(image)
+        hsv_image[..., 1] = torch.clamp(hsv_image[..., 1] + saturation, 0, 1)
+        image = F.hsv_to_rgb(hsv_image)
+        
+    elif cj_type == "c":
+        brightness = torch.tensor(10, dtype=torch.float32)
+        contrast = torch.tensor(random.randint(40, 100), dtype=torch.float32)
+        # Apply contrast jittering
+        mean = torch.mean(image)
+        image = torch.clamp((image - mean) * (contrast / 127 + 1) - contrast + brightness, 0, 1)
+    
+    return image
+
+
+    
+
+#gausian blurr
+def gaussian_blur(image, l=3, sig=2):
+    # Gaussian kernel
+    ax = np.linspace(-(l - 1) / 2., (l - 1) / 2., l)
+    xx, yy = np.meshgrid(ax, ax)
+    kernel = np.exp(-0.5 * (np.square(xx) + np.square(yy)) / np.square(sig))
+    kernel /= np.sum(kernel) 
+    blurred_image = cv2.filter2D(image.numpy(), -1, kernel)
+    
+    return torch.from_numpy(blurred_image)
+
+custom_transform = transforms.Compose([
+    transforms.Resize((224, 224)),  # Resize to match EfficientNet input size
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  ,
+    
+])
+
+composed_transform = transforms.Compose([
+    gaussian_blur,
+    color_jitter,
+   
+])
+
+annotations_file = "annotation_frame.csv"
+img_dir = "img/"
+custom_dataset = CustomImageDataset(annotations_file, img_dir, transform=custom_transform)
+data_loader = DataLoader(custom_dataset, batch_size=15, shuffle=True)
+print(custom_dataset.img_labels.head())
+print(len(custom_dataset))
+
+# Apply Gaussian blur and color jitter to the first two images
+image1, label1 = custom_dataset[0]
+image2, label2 = custom_dataset[703]
+
+# Display the original and transformed images
+fig, axs = plt.subplots(1, 4, figsize=(12, 4))
+
+axs[0].imshow(image1.permute(1, 2, 0))  # Transpose dimensions from (3, 224, 224) to (224, 224, 3)
+axs[0].set_title('Original Image blur 1')
+axs[0].axis('off')
+
+# Apply Gaussian blur to the first image
+blurred_image = gaussian_blur(image1.permute(1, 2, 0))  # Transpose dimensions before applying blur
+axs[1].imshow(blurred_image)
+axs[1].set_title('Blurred Image 1')
+axs[1].axis('off')
+
+# Apply color jitter to the second image
+jittered_image = color_jitter(image2.permute(1, 2, 0))
+axs[2].imshow(jittered_image)
+axs[2].set_title('Jittered Image 2')
+axs[2].axis('off')
+
+# Original images
+axs[3].imshow(image2.permute(1, 2, 0))
+axs[3].set_title('Original Image color jitter 2')
+axs[3].axis('off')
+
+plt.show()
+
+def sampled_dataset(annotations_file, threshold):
+    img_labels = pd.read_csv(annotations_file)
+    class_counts = Counter(img_labels['label'])
+    
+    oversampled_indices = []
+    undersampled_indices = []
+    
+    for label, count in class_counts.items():
+        if count < threshold:
+            oversampled_indices.extend(img_labels[img_labels['label'] == label].index.tolist())
+        elif count > threshold:
+            undersampled_indices.extend(img_labels[img_labels['label'] == label].sample(threshold).index.tolist())
+    
+    indices_to_use = list(set(oversampled_indices + undersampled_indices))
+    
+    return img_labels.iloc[indices_to_use]
+    
+
+annotations_file = "annotation_frame.csv"
+img_dir = "img/"
+threshold = 50
+
+preprocessed_dataset = sampled_dataset(annotations_file, threshold)
+print(len(preprocessed_dataset))
+print(preprocessed_dataset.head())
+#print(preprocessed_dataset['label'].value_counts())
+
+train_data, val_test_data = train_test_split(preprocessed_dataset, test_size=0.2, random_state=42)
+val_data, test_data = train_test_split(val_test_data, test_size=0.5, random_state=42)
+
+train_data.to_csv("train_annotations.csv", index=False)
+val_data.to_csv("val_annotations.csv", index=False)
+test_data.to_csv("test_annotations.csv", index=False)
+
+train_annotations_file = "train_annotations.csv"
+val_annotations_file = "val_annotations.csv"
+test_annotations_file = "test_annotations.csv"
+
+train_dataset = CustomImageDataset(train_annotations_file, img_dir, transform=custom_transform)
+val_dataset = CustomImageDataset(val_annotations_file, img_dir, transform=custom_transform)
+test_dataset = CustomImageDataset(test_annotations_file, img_dir, transform=custom_transform)
+
+#dataloaders
+batch_size = 32  # Define batch size
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_dataloader = DataLoader(val_dataset, batch_size=batch_size)
+test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
+print(len(train_dataset))
+
+
+
+for images, labels in train_dataloader:
+    for image, label in zip(images, labels):
+        #print("Label:", label.item())  
+        pass
+
+
+weights = torchvision.models.EfficientNet_B0_Weights.DEFAULT
+model = torchvision.models.efficientnet_b0(weights=weights) 
+model._conv_stem = nn.Conv2d(1, 32, kernel_size=3, stride=2, bias=False)
+for param in model.parameters():
+    param.requires_grad = False
+
+num_features = model.classifier[1].in_features 
+model.classifier[1] = nn.Linear(num_features, 12) 
+model.classifier[1].requires_grad = True
+
+if torch.cuda.is_available():
+    model = model.cuda() 
+model1_path = 'model1.pth'
+torch.save(model.state_dict(), model1_path)
+model.classifier
+
+
+loss_fn = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+
+def train_one_epoch(model, dataloader, loss_fn, optimizer, device):
+    model.train()
+    running_loss = 0.0
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    for imgs, labels in tqdm(dataloader, desc='Training'):
+        imgs, labels = imgs.to(device), labels.to(device)
+        
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        outputs = model(imgs)
+
+        # Print target labels for debugging
+        #print("Target Labels:", labels)
+
+        # Compute loss
+        loss = loss_fn(outputs, labels)
+
+        # Backward pass and optimization
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+
+    return running_loss / len(dataloader)
+
+from torchmetrics import Accuracy
+def validate_one_epoch(model, dataloader, loss_fn, device, num_classes):
+    model.eval()
+    total_loss = 0.0
+    accuracy = Accuracy(task="multiclass", num_classes=12).to(device)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    total_batches = len(dataloader)
+    for imgs, labels in tqdm(dataloader, desc='Validation'):
+        imgs, labels = imgs.to(device), labels.to(device)
+
+        with torch.no_grad():
+            outputs = model(imgs)
+            loss = loss_fn(outputs, labels)
+            total_loss += loss.item() * imgs.size(0)
+
+        # Update the accuracy metric
+        accuracy(outputs, labels)
+
+    average_loss = total_loss / len(dataloader.dataset)
+    accuracy_result = accuracy.compute()
+
+    return average_loss, accuracy_result
+
+
+def train_and_validate(model, train_dataloader, val_dataloader, loss_fn, optimizer, device, n_epochs, model1_path, num_classes):
+    train_losses = []
+    val_losses = []
+    best_val_loss = float('inf')
+    
+    for epoch in range(n_epochs):
+        print(f"Epoch {epoch + 1}/{n_epochs}")
+        
+        train_loss = train_one_epoch(model, train_dataloader, loss_fn, optimizer, device)
+        val_loss, _ = validate_one_epoch(model, val_dataloader, loss_fn, device, num_classes)
+        
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        
+        print(f"Train Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}")
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), model1_path)
+    
+    return train_losses, val_losses
+
+#number of epochs
+n_epochs = 10
+num_classes=12
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+train_losses, val_losses = train_and_validate(model, train_dataloader, val_dataloader, loss_fn, optimizer, device, n_epochs, model1_path,num_classes)
+
+for epoch, loss in enumerate(train_losses, 1):
+    print(f"Epoch {epoch}: {loss:.4f}")
+
+print("\nValidation Losses:")
+for epoch, loss in enumerate(val_losses, 1):
+    print(f"Epoch {epoch}: {loss:.4f}")
+import torchmetrics
+
+def model_testing(model, test_loader, device, model_path, num_classes):
+    model.load_state_dict(torch.load(model_path))
+    model.eval()
+    
+    
+    f1_metric = torchmetrics.F1Score(num_classes=num_classes, task='multiclass')
+    
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+            outputs = model(images)
+            
+
+            f1_metric.update(outputs, labels)
+    
+    final_f1_score = f1_metric.compute()
+    
+    return final_f1_score
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+num_classes = 12
+final_f1_score = model_testing(model, test_dataloader, device, 'model1.pth', num_classes)
+print("Final F1 Score:", final_f1_score)
+
